@@ -17,14 +17,16 @@ export function createApp(settings=process.env){
  if(!frontend.pathname.endsWith('/'))throw Error('FRONTEND_URLの末尾に / が必要です。');
  // Callback URI is also used by the shared Discord handler.
  process.env.API_BASE_URL=publicBase;
- const allowed=new Set((settings.ADMIN_DISCORD_IDS||'').split(',').map(x=>x.trim()).filter(Boolean));
+ const owners=new Set((settings.ADMIN_DISCORD_IDS||'').split(',').map(x=>x.trim()).filter(Boolean));
  const dbPath=settings.DB_PATH||'data/dis-manager.sqlite';
  if(dbPath!==':memory:')mkdirSync(path.dirname(dbPath),{recursive:true,mode:0o700});
  const db=new DatabaseSync(dbPath);
  db.exec('PRAGMA journal_mode=WAL; PRAGMA busy_timeout=5000;');
  db.exec(readFileSync(new URL('./schema.sql',import.meta.url),'utf8').replaceAll('CREATE TABLE `','CREATE TABLE IF NOT EXISTS `'));
  db.exec(`CREATE TABLE IF NOT EXISTS web_sessions (token TEXT PRIMARY KEY,owner TEXT NOT NULL,expires_at INTEGER NOT NULL);
- CREATE TABLE IF NOT EXISTS login_tickets (ticket TEXT PRIMARY KEY,owner TEXT NOT NULL,challenge TEXT NOT NULL,expires_at INTEGER NOT NULL);`);
+ CREATE TABLE IF NOT EXISTS login_tickets (ticket TEXT PRIMARY KEY,owner TEXT NOT NULL,challenge TEXT NOT NULL,expires_at INTEGER NOT NULL);
+ CREATE TABLE IF NOT EXISTS administrators (discord_id TEXT PRIMARY KEY,label TEXT NOT NULL,added_by TEXT NOT NULL,created_at INTEGER NOT NULL);`);
+ const isAllowed=id=>owners.has(id)||!!db.prepare('SELECT 1 FROM administrators WHERE discord_id=?').get(id);
  const DB={
   prepare(sql){
    const stmt=db.prepare(sql);
@@ -49,9 +51,9 @@ export function createApp(settings=process.env){
   if(!['GET','HEAD'].includes(req.method)&&!p.startsWith('/api/bot/')&&origin!==frontend.origin)return reply({error:'管理画面から操作してください。'},403);
   const auth=req.headers.get('Authorization')||'';
   const owner=auth.startsWith('Bearer ')?sessions.get(hash(auth.slice(7)),now())?.owner:null;
-  const validOwner=owner&&allowed.has(owner)?owner:null;
+  const validOwner=owner&&isAllowed(owner)?owner:null;
   if(p==='/api/discord/start'&&req.method==='GET'){
-   if(!env.DISCORD_CLIENT_SECRET||!env.DISCORD_CLIENT_ID||!env.DISCORD_BOT_TOKEN||!allowed.size)return reply({error:'EC2の初回設定を完了してください。'},503);
+   if(!env.DISCORD_CLIENT_SECRET||!env.DISCORD_CLIENT_ID||!env.DISCORD_BOT_TOKEN||!owners.size)return reply({error:'EC2の初回設定を完了してください。'},503);
    const challenge=url.searchParams.get('challenge')||'';
    if(!/^[a-f0-9]{64}$/.test(challenge))return reply({error:'管理画面の接続ボタンから開始してください。'},400);
    db.prepare('DELETE FROM oauth_states WHERE expires_at<?').run(now());
@@ -70,7 +72,7 @@ export function createApp(settings=process.env){
    try{
     const tokens=await tokenRequest(env,{grant_type:'authorization_code',code:url.searchParams.get('code'),redirect_uri:publicBase+'/api/discord/callback'});
     const user=await discord('/users/@me','Bearer '+tokens.access_token);
-    if(!allowed.has(user.id))return reply({error:'このDiscordアカウントには管理者の許可がありません。'},403);
+    if(!isAllowed(user.id))return reply({error:'このDiscordアカウントには管理者の許可がありません。'},403);
     db.prepare('INSERT INTO discord_connections(owner,discord_id,username,tokens,expires_at) VALUES(?,?,?,?,?) ON CONFLICT(owner) DO UPDATE SET username=excluded.username,tokens=excluded.tokens,expires_at=excluded.expires_at').run(user.id,user.id,user.global_name||user.username,await seal(tokens,env),now()+tokens.expires_in);
     db.prepare('DELETE FROM login_tickets WHERE expires_at<?').run(now());
     const ticket=random();db.prepare('INSERT INTO login_tickets VALUES(?,?,?,?)').run(hash(ticket),user.id,pending.owner,now()+60);
@@ -81,7 +83,7 @@ export function createApp(settings=process.env){
    const {ticket,verifier}=await req.json();
    if(typeof ticket!=='string'||typeof verifier!=='string'||verifier.length>128)return reply({error:'認証情報が不正です。'},400);
    const row=db.prepare('DELETE FROM login_tickets WHERE ticket=? AND challenge=? AND expires_at>? RETURNING owner').get(hash(ticket),hash(verifier),now());
-   if(!row||!allowed.has(row.owner))return reply({error:'ログインをやり直してください。'},401);
+   if(!row||!isAllowed(row.owner))return reply({error:'ログインをやり直してください。'},401);
    const token=random();db.prepare('DELETE FROM web_sessions WHERE expires_at<?').run(now());
    db.prepare('INSERT INTO web_sessions VALUES(?,?,?)').run(hash(token),row.owner,now()+86400);
    return reply({token});
@@ -89,11 +91,44 @@ export function createApp(settings=process.env){
   if(p==='/api/status'&&req.method==='GET'){
    const headers=new Headers(req.headers);headers.set('oai-authenticated-user-id',validOwner||'anonymous');
    const result=await handle(new Request(req,{headers}),env);const status=await result.json();
-   if(!allowed.size){status.configured=false;status.missing.push('ADMIN_DISCORD_IDS')}
+   if(!owners.size){status.configured=false;status.missing.push('ADMIN_DISCORD_IDS')}
+   status.canManageAdmins=!!validOwner&&owners.has(validOwner);
    return reply(status,result.status);
   }
   if(p==='/api/bot/configs')return handle(req,env);
   if(!validOwner)return reply({error:'Discordに接続してください。'},401);
+  const adminRoute=p.match(/^\/api\/admins(?:\/(\d{17,22}))?$/);
+  if(adminRoute){
+   if(!owners.has(validOwner))return reply({error:'管理者の登録・削除はオーナーだけが操作できます。'},403);
+   if(req.method==='GET'&&!adminRoute[1]){
+    const names=new Map(db.prepare('SELECT discord_id,username FROM discord_connections').all().map(r=>[r.discord_id,r.username]));
+    const admins=[...owners].map(discordId=>({discordId,label:names.get(discordId)||'',role:'owner'}));
+    for(const r of db.prepare('SELECT * FROM administrators ORDER BY created_at,discord_id').all()){
+     if(!owners.has(r.discord_id))admins.push({discordId:r.discord_id,label:r.label||names.get(r.discord_id)||'',role:'admin'});
+    }
+    return reply({admins});
+   }
+   if(req.method==='POST'&&!adminRoute[1]){
+    let data;try{data=await req.json()}catch{return reply({error:'登録内容を読み取れません。'},400)}
+    const {discordId,label=''}=data||{};
+    if(typeof discordId!=='string'||!/^\d{17,22}$/.test(discordId)||typeof label!=='string'||label.length>80)return reply({error:'DiscordユーザーID（17〜22桁）と表示名（80文字以内）を確認してください。'},400);
+    if(isAllowed(discordId))return reply({error:'このユーザーは登録済みです。'},409);
+    const total=db.prepare('SELECT COUNT(*) AS n FROM administrators').get().n;
+    if(total>=100)return reply({error:'追加できる管理者は100人までです。'},400);
+    db.prepare('INSERT INTO administrators VALUES(?,?,?,?)').run(discordId,label.trim(),validOwner,now());
+    return reply({ok:true},201);
+   }
+   if(req.method==='DELETE'&&adminRoute[1]){
+    const target=adminRoute[1];
+    if(owners.has(target))return reply({error:'初回設定のオーナーは削除できません。'},409);
+    const removed=db.prepare('DELETE FROM administrators WHERE discord_id=?').run(target);
+    if(!removed.changes)return reply({error:'管理者が見つかりません。'},404);
+    db.prepare('DELETE FROM web_sessions WHERE owner=?').run(target);
+    db.prepare('DELETE FROM login_tickets WHERE owner=?').run(target);
+    return reply({ok:true});
+   }
+   return reply({error:'操作できません。'},405);
+  }
   if(!p.startsWith('/api/'))return reply({error:'ページが見つかりません。'},404);
   const headers=new Headers(req.headers);
   // Never accept identity headers supplied by a visitor.

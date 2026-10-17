@@ -34,10 +34,42 @@ function updateActions(){
  $('delete-panel').disabled=busy||!draft?.id||draft?.published;
  $('saved').textContent=dirty?'未保存の変更があります':draft?.id?(live?'サイトに保存済み':'このブラウザに保存済み'):'新規・未保存';
  $('publish-help').textContent=!live?'Discordに接続すると投稿できます。':dirty||!draft?.id?'先に設定を保存してください。':!status.botOnline?'Bot本体は未接続です。投稿後の自動ロール付与にはBotの起動が必要です。':draft?.changed?'保存した変更は「Discordの投稿を更新」で反映されます。':draft?.published?'この設定はDiscordに投稿済みです。':'保存した内容をDiscordに投稿します。';
+ for(const el of $('admins-page').querySelectorAll('input,button'))el.disabled=busy||!status.canManageAdmins;
  $('message-link').hidden=!live||!draft?.messageId;
  if(draft?.messageId)$('message-link').href='https://discord.com/channels/'+$('guild').value+'/'+$('channel').value+'/'+draft.messageId;
 }
-function showPage(page){const conn=page==='connection';$('role-page').hidden=conn;$('connection-page').hidden=!conn;$('breadcrumb').textContent=conn?'Discord接続':'リアクションロール';for(const [id,active] of [['nav-roles',!conn],['nav-connection',conn]]){$(id).classList.toggle('active',active);if(active)$(id).setAttribute('aria-current','page');else $(id).removeAttribute('aria-current')}closeMenu()}
+let currentPage='roles';
+function showPage(page){
+ if(page==='admins'&&!status.canManageAdmins)return;
+ currentPage=page;
+ for(const name of ['roles','connection','admins']){
+  const pageId=name==='roles'?'role-page':name+'-page';$(pageId).hidden=name!==page;
+  const nav=$('nav-'+name);nav.classList.toggle('active',name===page);if(name===page)nav.setAttribute('aria-current','page');else nav.removeAttribute('aria-current');
+ }
+ $('breadcrumb').textContent={roles:'リアクションロール',connection:'Discord接続',admins:'管理者'}[page];closeMenu();
+}
+async function loadAdmins(){
+ const {admins}=await api('/admins');$('admin-list').replaceChildren();
+ for(const entry of admins){
+  const row=document.createElement('tr'),person=document.createElement('td'),name=document.createElement('strong'),id=document.createElement('small');
+  name.textContent=entry.label||'名前未設定';id.textContent=entry.discordId;person.append(name,id);
+  const role=document.createElement('td');role.textContent=entry.role==='owner'?'オーナー':'管理者';
+  const action=document.createElement('td');
+  if(entry.role!=='owner'){
+   const button=document.createElement('button');button.type='button';button.textContent='削除';button.setAttribute('aria-label',(entry.label||entry.discordId)+'の管理者権限を削除');
+   button.onclick=()=>{if(!confirm((entry.label||entry.discordId)+' の管理者権限を削除しますか？'))return;run(async()=>{await api('/admins/'+entry.discordId,{method:'DELETE'});await loadAdmins();toast('管理者権限を削除しました。')})};
+   action.append(button);
+  }else action.textContent='—';
+  row.append(person,role,action);$('admin-list').append(row);
+ }
+ $('admin-list-status').textContent=admins.length+'人が登録されています。';
+}
+$('nav-admins').onclick=()=>{showPage('admins');run(loadAdmins)};
+$('admin-refresh').onclick=()=>run(loadAdmins);
+$('admin-form').onsubmit=event=>{event.preventDefault();run(async()=>{
+ await api('/admins',{method:'POST',body:JSON.stringify({discordId:$('admin-id').value.trim(),label:$('admin-label').value.trim()})});
+ $('admin-form').reset();await loadAdmins();toast('管理者を登録しました。');
+})};
 function renderPanels(){const list=[...panels];if(draft&&!draft.id)list.push({id:'new',name:draft.name+'（未保存）'});options($('panel-select'),list,draft?.id||'new',p=>p.name+(p.published?'（投稿済み）':''))}
 function setDraft(panel){draft=structuredClone(panel);chosen.clear();dirty=false;$('panel-name').value=draft.name;$('title').value=draft.title;$('message').value=draft.message;$('remove').checked=draft.remove;$('single').checked=draft.single;renderPanels();renderRows();preview();updateActions()}
 function renderRows(){$('rows').replaceChildren();if(!draft)return;draft.roles.forEach((r,i)=>{
@@ -55,6 +87,8 @@ async function loadGuild(){if(!live){resources={channels:demoChannels,roles:demo
 function demoImport(){if(Object.keys(localPanels).length)return;try{const old=JSON.parse(localStorage.getItem('sumi-roles'));if(old&&Array.isArray(old.roles)){localPanels['demo-roles']=[{...blank('以前の設定'),...old,id:uuid(),roles:old.roles.map(r=>({...r,roleId:demoRoles.find(x=>x.name===r.name)?.id||''}))}]}}catch{}}
 async function refresh(){
  status=await api('/status');live=status.configured&&status.connected;
+ $('nav-admins').hidden=!status.canManageAdmins;
+ if(currentPage==='admins'){if(status.canManageAdmins)await loadAdmins();else showPage('roles')}
  $('account-name').textContent=status.user?.name||'Discord未接続';$('account-status').textContent=live?'接続済み':'プレビューモード';$('mode-badge').textContent=live?'Discord接続済み':'プレビュー';
  $('bot-state').textContent='Bot：'+(status.botOnline?'稼働中':'未接続');$('gateway-status').textContent=status.botOnline?'Bot本体は稼働中です。':'Bot本体はまだ接続されていません。';
  $('connection-detail').textContent=status.connected?status.user.name+' と接続済みです。':status.configured?'Discordアカウントを接続してください。':'Application IDは設定済みです。初回設定の残りを完了すると接続できます。';

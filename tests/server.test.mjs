@@ -80,3 +80,30 @@ test('Discord login, saved panels, published bot config and disconnect guard',as
   assert.equal((await app.dispatch(request('/api/guilds',{headers}))).status,401);
  }finally{globalThis.fetch=originalFetch;app.close()}
 });
+test('only owners manage admins; removing an admin revokes sessions and login tickets',async()=>{
+ const app=createApp(settings),root='1061938805571063819',other='623456789012345678';
+ const until=Math.floor(Date.now()/1000)+3600;
+ app.db.prepare('INSERT INTO web_sessions VALUES(?,?,?)').run(hash('root-session'),root,until);
+ const headers={Origin:FRONT,Authorization:'Bearer root-session','Content-Type':'application/json'};
+ const add=(discordId,label='Helper')=>app.dispatch(request('/api/admins',{method:'POST',headers,body:JSON.stringify({discordId,label})}));
+ try{
+  assert.equal((await app.dispatch(request('/api/admins'))).status,401);
+  assert.equal((await add('123')) .status,400);
+  assert.equal((await add(other,'<script>alert(1)</script>')) .status,201);
+  assert.equal((await add(other)).status,409);
+  app.db.prepare('INSERT INTO web_sessions VALUES(?,?,?)').run(hash('other-session'),other,until);
+  app.db.prepare('INSERT INTO login_tickets VALUES(?,?,?,?)').run(hash('other-ticket'),other,hash('verifier'),until);
+  const otherHeaders={Origin:FRONT,Authorization:'Bearer other-session'};
+  const ownerStatus=await(await app.dispatch(request('/api/status',{headers}))).json();assert.equal(ownerStatus.canManageAdmins,true);
+  const otherStatus=await(await app.dispatch(request('/api/status',{headers:otherHeaders}))).json();assert.equal(otherStatus.canManageAdmins,false);
+  for(const method of ['GET','POST','DELETE']){
+   const denied=await app.dispatch(request(method==='DELETE'?'/api/admins/'+root:'/api/admins',{method,headers:otherHeaders,...(method==='POST'?{body:JSON.stringify({discordId:'723456789012345678'})}:{})}));assert.equal(denied.status,403);
+  }
+  const list=await(await app.dispatch(request('/api/admins',{headers}))).json();assert.equal(list.admins.length,2);assert.equal(list.admins[0].role,'owner');
+  assert.equal((await app.dispatch(request('/api/admins/'+root,{method:'DELETE',headers}))).status,409);
+  assert.equal((await app.dispatch(request('/api/admins/'+other,{method:'DELETE',headers}))).status,200);
+  assert.equal(app.db.prepare('SELECT count(*) AS n FROM web_sessions WHERE owner=?').get(other).n,0);
+  assert.equal(app.db.prepare('SELECT count(*) AS n FROM login_tickets WHERE owner=?').get(other).n,0);
+  assert.equal((await app.dispatch(request('/api/panels',{headers:otherHeaders}))).status,401);
+ }finally{app.close()}
+});
